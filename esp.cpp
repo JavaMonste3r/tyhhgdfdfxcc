@@ -1973,6 +1973,8 @@ namespace omega::esp
         // sample behind: positions stay on their own timer (one position read
         // per entity is the expensive part), the projection is free and runs
         // every frame.
+        void MatchScreenPlates(std::vector<Entity> &entities, bool useRenderPlates,
+                               float displayHeight);
         void Reproject(float displayWidth, float displayHeight, bool allowManaged = true,
                        std::vector<Entity> *target = nullptr)
         {
@@ -2730,6 +2732,12 @@ namespace omega::esp
                     entity.boxFromBones = false;
                 }
             }
+
+            // Bind screen-space nickname plates to their Entity boxes now that
+            // every Entity has valid visible/boxTop from the projection above.
+            // useRenderPlates = (target != nullptr): the render thread passes its
+            // own g_renderEntities snapshot; the worker uses g_plates directly.
+            MatchScreenPlates(entities, target != nullptr, displayHeight);
 
             // What this frame actually shows, counted where it is known. Sample()
             // rebuilds every Entity with visible=false, so the same count taken
@@ -4590,20 +4598,23 @@ namespace omega::esp
                 if (!candidates.empty())
                 {
                     body += "\n-- chosen joints --\n";
-                    float middle = 0.0f;
+                    float middleX = 0.0f;
+                    float middleZ = 0.0f;
                     for (const JointCandidate &candidate : candidates)
                     {
-                        middle += candidate.pos.x;
+                        middleX += candidate.pos.x;
+                        middleZ += candidate.pos.z;
                     }
-                    middle /= static_cast<float>(candidates.size());
+                    middleX /= static_cast<float>(candidates.size());
+                    middleZ /= static_cast<float>(candidates.size());
                     for (const JointCandidate &candidate : candidates)
                     {
                         char line[160];
                         std::snprintf(line, sizeof(line),
                                       "bone=%2d  %-30s  dx=%6.2f dy=%6.2f dz=%6.2f\n",
                                       candidate.bone, candidate.name,
-                                      candidate.pos.x - middle, candidate.pos.y - low,
-                                      candidate.pos.z);
+                                      candidate.pos.x - middleX, candidate.pos.y - low,
+                                      candidate.pos.z - middleZ);
                         body += line;
                     }
                 }
@@ -5047,7 +5058,55 @@ namespace omega::esp
                 float firstJumpLength = 0.0f;
                 const bool baselinePass = slot.boneBaseline;
                 slot.boneBaseline = false;
+                // Detect a coherent whole-rig shift (seating in a vehicle,
+                // respawn, rigRoot swap): when at least 3 core bones move by
+                // the same vector (> 0.85 m but spread < 0.25 m), accept the
+                // new pose as a new baseline and clear boneHold so the jump
+                // filter does not suppress it. Without this, entering a car
+                // produced 10+ "held back" lines while the freeze lasted.
+                bool wholeRigShift = false;
                 if (!baselinePass && read > 0 && haveCaptureFeet)
+                {
+                    const int coreBones[4] = { BoneHips, BoneSpine, BoneChest, BoneHead };
+                    Vec3 coreDeltas[4]{};
+                    int shiftedCore = 0;
+                    for (int k = 0; k < 4; ++k)
+                    {
+                        const int b = coreBones[k];
+                        if (!slot.boneOk[b] || !previousOk[b])
+                        {
+                            continue;
+                        }
+                        const Vec3 before = aim::Sub(previousPosition[b], previousAnchor);
+                        const Vec3 after  = aim::Sub(newPosition[b],      captureFeet);
+                        const Vec3 delta  = aim::Sub(after, before);
+                        const float jumpLen = aim::Length(delta);
+                        if (aim::Finite(jumpLen) && jumpLen > 0.85f)
+                        {
+                            coreDeltas[shiftedCore++] = delta;
+                        }
+                    }
+                    if (shiftedCore >= 3)
+                    {
+                        wholeRigShift = true;
+                        for (int k = 1; k < shiftedCore; ++k)
+                        {
+                            if (aim::Length(aim::Sub(coreDeltas[k], coreDeltas[0])) > 0.25f)
+                            {
+                                wholeRigShift = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (wholeRigShift)
+                    {
+                        for (int bone = 0; bone < kBoneCount; ++bone)
+                        {
+                            slot.boneHold[bone] = 0;
+                        }
+                    }
+                }
+                if (!baselinePass && !wholeRigShift && read > 0 && haveCaptureFeet)
                 {
                     // Core and legs keep the old 0.85 m rule: a body changes
                     // place as a whole (seating, respawn) and must not be
@@ -5946,6 +6005,8 @@ namespace omega::esp
             bool screenSpace = false;
         };
         std::vector<Plate> g_plates;
+        std::vector<Plate> g_publishedPlates; // worker → lock → render hand-off
+        std::vector<Plate> g_renderPlates;    // render-thread's own copy
 
         void *ReadPointer(void *base, size_t offset);
 
@@ -6000,7 +6061,7 @@ namespace omega::esp
             return std::string();
         }
 
-        void CollectPlates()
+        void CollectPlates(float displayWidth, float displayHeight)
         {
             g_plates.clear();
             // Same cost as the nameplate probe: the class lookup is a scan over
@@ -6175,9 +6236,10 @@ namespace omega::esp
                 // resolved and wrote into the plate. The substitution list this
                 // was supposed to come from does not hold strings — every entry
                 // read back as garbage — so it stays only as a fallback.
+                void *tmp = nullptr;
                 if (plateObject != nullptr)
                 {
-                    void *tmp = Invoke1(getComponent, plateObject, tmpType);
+                    tmp = Invoke1(getComponent, plateObject, tmpType);
                     void *managed = tmp != nullptr ? Invoke1(getText, tmp, nullptr) : nullptr;
                     if (managed != nullptr)
                     {
@@ -6196,23 +6258,41 @@ namespace omega::esp
                 {
                     continue;
                 }
-                void *transform = Invoke1(m_getTransform, plateObject, nullptr);
+                // m_getTransform is Component.get_transform(): pass a Component
+                // (tmp or the plateObject itself when tmp is null), never a
+                // raw GameObject. The old code passed plateObject (a GameObject)
+                // and got a null transform on every call.
+                void *transformSource = tmp != nullptr ? tmp : component;
+                void *transform = Invoke1(m_getTransform, transformSource, nullptr);
                 Plate plate;
                 if (transform == nullptr || !TransformPosition(transform, plate.world))
                 {
                     continue;
                 }
+                // Pooled inactive overlays are parked at y ≈ 10 000.
+                if (!aim::Finite(plate.world.y) || std::fabs(plate.world.y) > 5000.0f)
+                {
+                    continue;
+                }
+                // Screen Space Overlay UI (UiCanvas): z == 0 and x/y inside
+                // the viewport. Per-plate detection handles canvases where each
+                // plate has a distinct anchor (the old all-same-pos heuristic
+                // missed those and returned plates=0).
+                if (std::fabs(plate.world.z) < 0.01f &&
+                    displayWidth > 1.0f && displayHeight > 1.0f &&
+                    plate.world.x >= -64.0f && plate.world.x <= displayWidth  + 64.0f &&
+                    plate.world.y >= -64.0f && plate.world.y <= displayHeight + 64.0f)
+                {
+                    plate.screenSpace = true;
+                }
                 std::snprintf(plate.text, sizeof(plate.text), "%s", text.c_str());
                 g_plates.push_back(plate);
             }
 
-            // A screen-space canvas leaves every plate anchored to the hud, so
-            // the transforms either all sit on the same spot or jitter around
-            // it. Those plates are useless in world space but their transform
-            // position is already screen pixels, which is what the game itself
-            // feeds to SetPosition — so the set is kept and matched screen-to-
-            // screen instead of being thrown away (that throw-away is why every
-            // walk line carried plates=0 no matter how many players were up).
+            // Legacy world-space heuristic: when every plate reports the same
+            // position (old screen-space canvas variant), mark all as screenSpace.
+            // The per-plate z/xy detection above already handles the common case;
+            // this catches the edge case where z != 0 but all anchors cluster.
             if (g_plates.size() >= 2)
             {
                 bool distinct = false;
@@ -6254,10 +6334,19 @@ namespace omega::esp
         // to is the one drawn right under them: nearest box top, with the plate
         // above the head where the game puts it. Runs after Reproject, because
         // that is the first moment the boxes have pixel coordinates.
-        void MatchScreenPlates()
+        // Screen-space plates carry no world position, so the body they belong
+        // to is the one drawn right under them: nearest box top, with the plate
+        // above the head where the game puts it. Runs at the end of Reproject,
+        // which is the first moment boxes have pixel coordinates.
+        // useRenderPlates: true when called from the render thread (use g_renderPlates),
+        // false when called on the worker thread (use g_plates).
+        // displayHeight: needed to flip Unity's bottom-left Y to DX11 top-left Y.
+        void MatchScreenPlates(std::vector<Entity> &entities, bool useRenderPlates,
+                               float displayHeight)
         {
+            const std::vector<Plate> &plates = useRenderPlates ? g_renderPlates : g_plates;
             bool anyScreen = false;
-            for (const Plate &plate : g_plates)
+            for (const Plate &plate : plates)
             {
                 if (plate.screenSpace && plate.text[0] != '\0')
                 {
@@ -6265,24 +6354,27 @@ namespace omega::esp
                     break;
                 }
             }
-            if (!anyScreen)
+            if (!anyScreen || displayHeight <= 1.0f)
             {
                 return;
             }
 
-            for (Entity &entity : g_entities)
+            for (Entity &entity : entities)
             {
                 entity.nickname[0] = '\0';
             }
-            for (const Plate &plate : g_plates)
+            for (const Plate &plate : plates)
             {
                 if (!plate.screenSpace || plate.text[0] == '\0')
                 {
                     continue;
                 }
+                // Unity UiCanvas origin is bottom-left (Y up);
+                // DX11/ImGui boxTop is top-left (Y down) — flip.
+                const float plateY = displayHeight - plate.world.y;
                 Entity *best = nullptr;
                 float bestDistance = 220.0f;   // pixels, plate to box top
-                for (Entity &entity : g_entities)
+                for (Entity &entity : entities)
                 {
                     if (!entity.visible || entity.boxTop <= 0.0f)
                     {
@@ -6290,9 +6382,9 @@ namespace omega::esp
                     }
                     const float centreX = (entity.boxLeft + entity.boxRight) * 0.5f;
                     const float dx = plate.world.x - centreX;
-                    const float dy = plate.world.y - entity.boxTop;
-                    // The plate hangs above the head: a body under the plate,
-                    // never a body in front of it.
+                    const float dy = plateY - entity.boxTop;
+                    // The plate hangs above the head: reject bodies that are
+                    // below the plate (dy > 60) or way above it (dy < -160).
                     if (dy > 60.0f || dy < -160.0f)
                     {
                         continue;
@@ -6304,11 +6396,7 @@ namespace omega::esp
                         best = &entity;
                     }
                 }
-                if (best == nullptr)
-                {
-                    continue;
-                }
-                if (best->nickname[0] != '\0')
+                if (best == nullptr || best->nickname[0] != '\0')
                 {
                     continue;   // one name per body, first plate wins
                 }
@@ -6432,6 +6520,19 @@ namespace omega::esp
                 if (transform == nullptr)
                 {
                     continue;
+                }
+
+                // Pooled characters park at y ≈ 10000 while inactive. Reading
+                // their transform every scan costs Animator resolution budget
+                // and spams the rig log with false far= entries. Discard before
+                // any allocation so they never enter g_slots.
+                {
+                    Vec3 scanPos{};
+                    if (TransformPosition(transform, scanPos) &&
+                        (!aim::Finite(scanPos.y) || std::fabs(scanPos.y) > 5000.0f))
+                    {
+                        continue;
+                    }
                 }
 
                 Slot slot;
@@ -8017,8 +8118,8 @@ namespace omega::esp
             // после SyncBonesFromSlots — двойной сдвиг smoothFeet за один
             // кадр давал постоянную микродрожь. Единственный Reproject теперь
             // только в ManagedTick после SyncBonesFromSlots().
-            // MatchScreenPlates не зависит от Reproject в этот момент.
-            MatchScreenPlates();
+            // MatchScreenPlates перенесён в конец Reproject() — там Entity уже
+            // имеют правильные visible=true и boxTop, иначе он всегда давал 0.
 
             // Both numbers come from the frame Reproject finished, not from a
             // walk over g_entities: Sample() has just rebuilt every Entity from
@@ -8484,6 +8585,7 @@ namespace omega::esp
     {
         AcquireSRWLockExclusive(&g_entityLock);
         g_publishedEntities = g_entities;
+        g_publishedPlates   = g_plates;
         std::memcpy(g_publishedMvp, g_mvp, sizeof(g_mvp));
         g_publishedMvpValid = g_mvpValid;
         // The version moves together with the data it describes, under the same
@@ -8511,6 +8613,7 @@ namespace omega::esp
 
         AcquireSRWLockShared(&g_entityLock);
         g_renderEntities = g_publishedEntities;
+        g_renderPlates   = g_publishedPlates;
         std::memcpy(g_renderMvp, g_publishedMvp, sizeof(g_renderMvp));
         g_renderMvpValid = g_publishedMvpValid;
         g_renderSeq = g_publishSeq;
@@ -9167,7 +9270,7 @@ namespace omega::esp
         // second FindObjectsOfType (16-31 ms measured) and every run so far ends
         // with "plates: kept 0 of 11" - it produces nothing and costs a stutter
         // every 30 s. Flip to true only when a working plate path exists.
-        constexpr bool kCollectPlates = false;
+        constexpr bool kCollectPlates = true;
         const ULONGLONG platesInterval = 30000;
         if (kCollectPlates && g_options.legacyScan && !modelMode && g_options.names &&
             g_platesTick != 0 &&
@@ -9175,7 +9278,7 @@ namespace omega::esp
         {
             g_platesTick = now;
             const ULONGLONG platesStarted = NowMicroseconds();
-            CollectPlates();
+            CollectPlates(displayWidth, displayHeight);
             const ULONGLONG platesCost = NowMicroseconds() - platesStarted;
             if (platesCost >= 5000)
             {
